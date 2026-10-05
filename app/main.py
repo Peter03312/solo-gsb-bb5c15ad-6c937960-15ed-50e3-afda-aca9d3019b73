@@ -32,6 +32,9 @@ from .schemas import (
     RevocationResponse,
     VersionCreateRequest,
     VersionResponse,
+    VoucherDecision,
+    VoucherIssueRequest,
+    VoucherResponse,
 )
 from .seed import seed_demo_data
 from .service import InvalidTimeError, LicenseService, ServiceError
@@ -326,6 +329,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             closure=result["closure"],
             segments=[PermissionSegment(**segment) for segment in result["segments"]],
         )
+
+    @app.post(
+        "/permissions/vouchers",
+        response_model=VoucherResponse,
+        status_code=201,
+        tags=["permissions"],
+        summary="把一次用途判定作为可追溯凭证原子签发并持久保存",
+        responses={
+            200: {"description": "同标识与同输入重试，返回首次保存的原凭证"},
+            201: {"description": "首次签发：判定与保存已原子完成，返回凭证"},
+            404: {"description": "版本不存在"},
+            409: {"description": "凭证标识复用到不同输入"},
+            422: {"description": "判定时刻缺少时区或无法解析，或用途为空白"},
+        },
+    )
+    def issue_voucher(
+        payload: VoucherIssueRequest, request: Request
+    ) -> JSONResponse | VoucherResponse:
+        voucher, replayed = service_from(request).issue_voucher(
+            voucher_id=payload.voucher_id,
+            version_id=payload.version_id,
+            use=payload.use,
+            at=payload.at,
+        )
+        body = VoucherResponse(
+            replayed=replayed, voucher=VoucherDecision(**voucher)
+        )
+        if replayed:
+            # 200 OK distinguishes an idempotent retry from first-time issuing.
+            return JSONResponse(status_code=200, content=body.model_dump(mode="json"))
+        return body
+
+    @app.get(
+        "/permissions/vouchers/{voucher_id}",
+        response_model=VoucherDecision,
+        tags=["permissions"],
+        summary="按凭证标识查询首次保存的判定凭证（历史不可改写）",
+        responses={404: {"description": "凭证不存在"}},
+    )
+    def get_voucher(voucher_id: str, request: Request) -> VoucherDecision:
+        return VoucherDecision(**service_from(request).get_voucher(voucher_id))
 
     return app
 

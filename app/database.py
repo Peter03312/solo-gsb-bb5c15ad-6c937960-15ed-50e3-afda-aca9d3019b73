@@ -58,11 +58,30 @@ SCHEMA_STATEMENTS = [
         created_at    TEXT NOT NULL
     )
     """,
+    # A permission voucher freezes one permission decision as a traceable
+    # credential: the normalised request inputs (version, trimmed use, UTC
+    # instant) live in columns for idempotency/conflict checks, while the full
+    # decision (closure, basis, blockers, intersection) is captured as JSON in
+    # one write transaction with the evaluation. Rows are immutable history —
+    # no API ever updates or deletes them; later license changes or revocations
+    # must not rewrite a stored voucher.
+    """
+    CREATE TABLE IF NOT EXISTS permission_vouchers (
+        voucher_id     TEXT PRIMARY KEY,
+        version_id     TEXT NOT NULL REFERENCES versions(version_id),
+        use_name       TEXT NOT NULL,
+        at_value       TEXT NOT NULL,
+        registered_at  TEXT NOT NULL,
+        allowed        INTEGER NOT NULL,
+        decision_json  TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_changes_version_time "
     "ON license_changes(version_id, effective_at)",
     "CREATE INDEX IF NOT EXISTS idx_parents_version ON version_parents(version_id)",
     "CREATE INDEX IF NOT EXISTS idx_parents_parent ON version_parents(parent_id)",
     "CREATE INDEX IF NOT EXISTS idx_revocations_change ON change_revocations(change_id)",
+    "CREATE INDEX IF NOT EXISTS idx_vouchers_version ON permission_vouchers(version_id)",
 ]
 
 
@@ -281,4 +300,37 @@ class Database:
             "(revocation_id, change_id, reason, created_at) "
             "VALUES (?, ?, ?, ?)",
             (revocation_id, change_id, reason, created_at),
+        )
+
+    # -- permission vouchers ----------------------------------------------
+
+    def get_voucher(self, voucher_id: str) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM permission_vouchers WHERE voucher_id = ?",
+            (voucher_id,),
+        )
+
+    def insert_voucher(
+        self,
+        voucher_id: str,
+        version_id: str,
+        use_name: str,
+        at_value: str,
+        registered_at: str,
+        allowed: bool,
+        decision_json: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO permission_vouchers "
+            "(voucher_id, version_id, use_name, at_value, registered_at, "
+            "allowed, decision_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                voucher_id,
+                version_id,
+                use_name,
+                at_value,
+                registered_at,
+                1 if allowed else 0,
+                decision_json,
+            ),
         )

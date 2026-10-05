@@ -190,6 +190,52 @@ class CreateResponse(BaseModel):
     version: VersionResponse | None = None
 
 
+# -- permission vouchers ---------------------------------------------------
+
+
+class VoucherIssueRequest(BaseModel):
+    voucher_id: str | None = Field(
+        default=None, min_length=1, max_length=128, description="唯一凭证标识；省略时自动生成 UUID"
+    )
+    version_id: str = Field(min_length=1, description="已登记的数据集版本")
+    use: str = Field(min_length=1, description="拟申请的用途（去首尾空格后判定与留痕）")
+    at: datetime = Field(description="带时区的判定时刻，服务统一换算为 UTC 归一化")
+
+    _check_time = field_validator("at")(_ensure_aware)
+
+    @field_validator("use")
+    @classmethod
+    def _use(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("use 不能为空白字符串")
+        return value
+
+
+class VoucherDecision(BaseModel):
+    """一次用途判定的不可变凭证：首次保存时的完整判定快照。"""
+
+    voucher_id: str = Field(description="唯一凭证标识")
+    version_id: str
+    use: str
+    at: datetime = Field(description="换算为 UTC 后的判定时刻")
+    registered_at: datetime = Field(description="凭证登记时间（服务按 UTC 生成）")
+    allowed: bool
+    closure: list[str] = Field(description="首次判定时的自身及全部祖先（去重、广度优先）")
+    basis: list[BasisEntry] = Field(
+        default_factory=list, description="首次判定时各版本所依据的最近变更"
+    )
+    blockers: list[BlockerEntry] = Field(
+        default_factory=list, description="首次判定时的全部阻断版本与原因（允许时为空）"
+    )
+    allowed_uses_intersection: list[str] = Field(default_factory=list)
+
+
+class VoucherResponse(BaseModel):
+    replayed: bool = Field(description="同标识与同输入重试时为 true，返回首次保存的原凭证")
+    voucher: VoucherDecision
+
+
 # -- change preview --------------------------------------------------------
 
 

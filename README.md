@@ -20,6 +20,9 @@
   - **区间判定**仅以未作废变更划分片段，半开区间 `[start, end)` 口径与全部响应字段保持不变。
   - **变更预演**基于同一份「作废后」快照计算（已作废变更不参与现状判定），且同样不落库。
   - 原许可变更的**同标识重放**与**同版本同生效时刻冲突**规则不变；重放一条已作废变更只会返回原记录（仍标记为已作废），**不能恢复**它；与已作废变更同版本同生效时刻的新提交/预演仍报 `409`。
+- **用途判定凭证（可追溯）**：研究审批可把一次用途判定**固化为凭证**（`POST /permissions/vouchers`）。请求携带**唯一凭证标识、已登记版本、用途、带时区的判定时刻**；首次请求在**同一一致数据视图**中沿用现有判定规则，把服务按 UTC 生成的**登记时间**连同**完整祖先闭包、依据（basis）、阻断原因（blockers）与用途交集**一次性持久保存——**允许与拒绝都留痕**。判定与保存在**单个写事务内原子完成，失败不留半成品**。
+  - 凭证是**不可变历史**：`GET /permissions/vouchers/{voucher_id}` 始终返回**首次保存**的结果；之后的许可变更或作废只影响实时判定与预演，**不能改写历史凭证**。
+  - **幂等与冲突**：相同凭证标识、相同版本、**去首尾空格后相同的用途**、**换算为 UTC 后相同的判定时刻**重试 → `200` 且 `replayed=true`，返回原凭证；同一标识复用到不同输入（版本/用途/时刻任一不同）→ `409 conflict`；未知凭证 → `404 not_found`；未知版本 → `404`；空用途或无时区时刻 → `422`，且**均不留凭证**。
 - **幂等与冲突**：
   - 相同**变更标识**且语义内容（版本、生效时刻、允许用途集合；用途顺序/重复不影响）完全相同的重复提交，返回**同一结果**（HTTP `200`，`replayed=true`）；
   - 标识相同而内容不同 → `409 conflict`；
@@ -334,7 +337,74 @@ curl -X POST http://localhost:8000/license-changes -H 'Content-Type: application
 # -> 200 replayed=true，change.revocation 仍为原作废回执
 ```
 
-### 7. 查询接口
+### 7. 用途判定凭证（可追溯，判定与保存原子完成）
+
+`POST /permissions/vouchers` · `GET /permissions/vouchers/{voucher_id}`
+
+把一次用途判定固化为研究审批可追溯的凭证。首次请求在**单个 `BEGIN IMMEDIATE` 写事务**内、以同一一致快照完成「版本校验 → 祖先展开 → 沿用现有判定规则评估 → 写入凭证」，任一步失败全部回滚，**不留半成品凭证**。响应中的 `registered_at` 是服务按 UTC 生成的登记时间；`closure` / `basis` / `blockers` / `allowed_uses_intersection` 与 `GET /permissions/check` 的字段口径完全一致（`blockers` 为空即允许）。
+
+```bash
+curl -s -X POST http://localhost:8000/permissions/vouchers \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "voucher_id": "approval-2026-03-research-001",
+    "version_id": "demo-derived-1",
+    "use": " research ",
+    "at": "2026-03-01T08:00:00+08:00"
+  }'
+```
+
+首次签发返回 `201`（`replayed=false`），拒绝同样返回 `201` 并在 `blockers` 中给出全部阻断版本与原因；用途与时刻在服务侧归一化（去首尾空格、换算 UTC）：
+
+```json
+{
+  "replayed": false,
+  "voucher": {
+    "voucher_id": "approval-2026-03-research-001",
+    "version_id": "demo-derived-1",
+    "use": "research",
+    "at": "2026-03-01T00:00:00Z",
+    "registered_at": "2026-10-05T01:23:45.123456Z",
+    "allowed": true,
+    "closure": ["demo-derived-1", "demo-root-a", "demo-root-b"],
+    "basis": [ { "version_id": "...", "change_id": "...", "effective_at": "...", "allowed_uses": ["..."] } ],
+    "blockers": [],
+    "allowed_uses_intersection": ["research"]
+  }
+}
+```
+
+- **重试幂等**：相同凭证标识 + 相同版本 + 去空格后相同用途 + UTC 归一化后相同时刻（如 `+08:00` 与 `Z` 两种写法指向同一瞬间）→ `200` 且 `replayed=true`，凭证内容与首次**逐字段一致**（含首次的 `registered_at`）；
+- **历史不可改写**：签发后即使原变更被收紧、作废，凭证查询与同输入重试都恒返回首次结果；实时接口 `GET /permissions/check` 的判定照常随当前数据变化，不受影响；
+- **标识复用冲突**：同一 `voucher_id` 提交不同版本/用途/时刻 → `409 conflict`（错误详情回传已存输入与本次输入），原凭证保持不变；
+- `voucher_id` 省略时服务自动生成 UUID（`p-` 前缀）。
+
+| 情形 | 结果 |
+| --- | --- |
+| 首次签发（允许或拒绝） | `201`，`replayed=false` |
+| 同标识 + 同版本 + 同用途（去空格）+ 同时刻（UTC 归一化）重试 | `200`，`replayed=true`，返回原凭证 |
+| 标识复用到不同输入 | `409 conflict` |
+| 凭证标识不存在（GET） | `404 not_found` |
+| 版本不存在 | `404 not_found`，不留凭证 |
+| 用途为空白 | `422`，不留凭证 |
+| `at` 无时区或无法解析 | `422 invalid_time`，不留凭证 |
+
+```bash
+# 按凭证标识追溯（恒为首次保存的结果）
+curl -s http://localhost:8000/permissions/vouchers/approval-2026-03-research-001
+
+# 同输入重试：+08:00 写法与 Z 指向同一 UTC 瞬间 -> 200 replayed=true
+curl -s -X POST http://localhost:8000/permissions/vouchers \
+  -H 'Content-Type: application/json' \
+  -d '{"voucher_id":"approval-2026-03-research-001","version_id":"demo-derived-1","use":"research","at":"2026-03-01T00:00:00Z"}'
+
+# 复用标识指向不同用途 -> 409
+curl -s -X POST http://localhost:8000/permissions/vouchers \
+  -H 'Content-Type: application/json' \
+  -d '{"voucher_id":"approval-2026-03-research-001","version_id":"demo-derived-1","use":"commercial","at":"2026-03-01T00:00:00Z"}'
+```
+
+### 8. 查询接口
 
 | 方法与路径 | 说明 |
 | --- | --- |
@@ -343,6 +413,8 @@ curl -X POST http://localhost:8000/license-changes -H 'Content-Type: application
 | `GET /versions/{version_id}` | 版本详情，不存在返回 `404` |
 | `GET /license-changes/{change_id}` | 按标识查询变更（已作废仍可查，附 `revocation` 字段） |
 | `GET /license-changes/revocations/{revocation_id}` | 按作废标识追溯作废回执，不存在返回 `404` |
+| `POST /permissions/vouchers` | 把一次用途判定原子签发为可追溯凭证（首次 `201` / 同输入重试 `200` / 输入冲突 `409`） |
+| `GET /permissions/vouchers/{voucher_id}` | 追溯凭证，恒返回首次保存的判定；不存在返回 `404` |
 
 错误响应统一形如：
 
@@ -380,4 +452,4 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-测试覆盖：父引用存在性与不可变、祖先展开（含菱形去重）、用途交集、无有效许可阻断、最近变更生效、幂等重放、两类 409 冲突、时区校验、示例数据初始化，变更预演（目标与后代翻转、查询早于生效时刻/更晚变更覆盖不误报、重放无影响、冲突与 404 错误语义、菱形后代只计一次、预演不写入、并发提交下快照不混用），区间分段判定（变更边界切分、起点变更立即生效/终点变更不计入、无有效许可持续拒绝、菱形闭包去重、每段全部阻断版本与原因、与单时刻判定逐点一致、未知版本 404、无时区与倒置/空区间 422），以及许可变更作废（回执字段与追溯、同标识同内容重试返回原回执、标识复用内容不同/另一标识重复作废两类 409、目标不存在 404、原变更仍可查且带作废标记、单时点与区间判定对所有时刻忽略已作废变更、作废唯一变更后无有效许可阻断、祖先作废阻断后代、重放不能恢复、预演基于作废后快照且不落库、并发同标识重试恰一次创建、示例数据端到端）。
+测试覆盖：父引用存在性与不可变、祖先展开（含菱形去重）、用途交集、无有效许可阻断、最近变更生效、幂等重放、两类 409 冲突、时区校验、示例数据初始化，变更预演（目标与后代翻转、查询早于生效时刻/更晚变更覆盖不误报、重放无影响、冲突与 404 错误语义、菱形后代只计一次、预演不写入、并发提交下快照不混用），区间分段判定（变更边界切分、起点变更立即生效/终点变更不计入、无有效许可持续拒绝、菱形闭包去重、每段全部阻断版本与原因、与单时刻判定逐点一致、未知版本 404、无时区与倒置/空区间 422），许可变更作废（回执字段与追溯、同标识同内容重试返回原回执、标识复用内容不同/另一标识重复作废两类 409、目标不存在 404、原变更仍可查且带作废标记、单时点与区间判定对所有时刻忽略已作废变更、作废唯一变更后无有效许可阻断、祖先作废阻断后代、重放不能恢复、预演基于作废后快照且不落库、并发同标识重试恰一次创建、示例数据端到端），以及用途判定凭证（允许与拒绝都留痕、凭证内容与实时判定逐字段一致、去空格用途与 UTC 时刻归一化后同输入重试返回原凭证、标识复用到不同输入三类 409、未知凭证/未知版本 404、空用途/无时区 422 且不留凭证、省略标识自动生成、变更收紧与作废后历史凭证不可改写、并发同标识恰一次签发、示例数据端到端）。

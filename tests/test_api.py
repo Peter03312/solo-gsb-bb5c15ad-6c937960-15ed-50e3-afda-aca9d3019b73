@@ -826,6 +826,298 @@ def _revocation(client, revocation_id):
     return client.get(f"/license-changes/revocations/{revocation_id}")
 
 
+# -- permission vouchers ----------------------------------------------------
+
+
+def _issue_voucher(client, voucher_id, version_id, use, at):
+    return client.post(
+        "/permissions/vouchers",
+        json={
+            "voucher_id": voucher_id,
+            "version_id": version_id,
+            "use": use,
+            "at": at,
+        },
+    )
+
+
+def _get_voucher(client, voucher_id):
+    return client.get(f"/permissions/vouchers/{voucher_id}")
+
+
+def test_voucher_first_issue_records_full_decision_allow_and_deny(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research", "review"])
+    _register(client, "d1", ["a"])
+    _change(client, "cd1", "d1", _iso(2026, 1, 1), ["research"])
+
+    at = _iso(2026, 5, 1)
+    allowed = _issue_voucher(client, "v-ok", "d1", "research", at)
+    assert allowed.status_code == 201, allowed.text
+    body = allowed.json()
+    assert body["replayed"] is False
+    v = body["voucher"]
+    assert v["voucher_id"] == "v-ok"
+    assert v["version_id"] == "d1"
+    assert v["use"] == "research"
+    assert v["at"] == at
+    assert v["registered_at"].startswith("20")
+    assert v["allowed"] is True
+    assert v["closure"] == ["d1", "a"]
+    assert {b["version_id"] for b in v["basis"]} == {"d1", "a"}
+    assert v["blockers"] == []
+    assert v["allowed_uses_intersection"] == ["research"]
+
+    # Denials are persisted as vouchers too — allow and deny both leave a trace.
+    denied = _issue_voucher(client, "v-no", "d1", "review", at)
+    assert denied.status_code == 201
+    dv = denied.json()["voucher"]
+    assert dv["allowed"] is False
+    assert dv["blockers"] == [
+        {
+            "version_id": "d1",
+            "reason": "use_not_allowed",
+            "change_id": "cd1",
+            "effective_at": _iso(2026, 1, 1),
+            "allowed_uses": ["research"],
+        }
+    ]
+    assert dv["allowed_uses_intersection"] == ["research"]
+
+
+def test_voucher_decision_matches_live_point_check(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    _register(client, "d1", ["a"])
+    _change(client, "cd1", "d1", _iso(2026, 2, 1), ["research", "review"])
+
+    at = _iso(2026, 3, 1)
+    voucher = _issue_voucher(client, "v1", "d1", "research", at).json()["voucher"]
+    live = _check(client, "d1", "research", at).json()
+    for field in (
+        "version_id",
+        "use",
+        "at",
+        "allowed",
+        "closure",
+        "basis",
+        "blockers",
+        "allowed_uses_intersection",
+    ):
+        assert voucher[field] == live[field]
+    # Voucher-only extra field.
+    assert voucher["registered_at"]
+
+
+def test_voucher_retry_same_inputs_returns_original_voucher(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research", "review"])
+
+    first = _issue_voucher(client, "v1", "a", "  review  ", "2026-05-01T08:00:00+08:00")
+    assert first.status_code == 201
+    first_body = first.json()
+    assert first_body["voucher"]["use"] == "review"
+    assert first_body["voucher"]["at"] == "2026-05-01T00:00:00Z"
+
+    # Same id, trimmed use, same instant expressed in UTC -> replay, identical.
+    retry = _issue_voucher(client, "v1", "a", "review", "2026-05-01T00:00:00Z")
+    assert retry.status_code == 200
+    assert retry.json()["replayed"] is True
+    assert retry.json()["voucher"] == first_body["voucher"]
+
+    # GET always returns the same first-saved result.
+    fetched = _get_voucher(client, "v1")
+    assert fetched.status_code == 200
+    assert fetched.json() == first_body["voucher"]
+
+
+def test_voucher_same_id_different_inputs_conflict(client):
+    _register(client, "a")
+    _register(client, "b")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    _change(client, "cb", "b", _iso(2026, 1, 1), ["research"])
+
+    assert _issue_voucher(client, "v1", "a", "research", _iso(2026, 5, 1)).status_code == 201
+
+    different_use = _issue_voucher(client, "v1", "a", "review", _iso(2026, 5, 1))
+    assert different_use.status_code == 409
+    assert different_use.json()["error"] == "conflict"
+
+    different_time = _issue_voucher(client, "v1", "a", "research", _iso(2026, 6, 1))
+    assert different_time.status_code == 409
+
+    different_version = _issue_voucher(client, "v1", "b", "research", _iso(2026, 5, 1))
+    assert different_version.status_code == 409
+
+    # The original voucher is untouched and still fetchable.
+    original = _get_voucher(client, "v1").json()
+    assert original["version_id"] == "a"
+    assert original["use"] == "research"
+    assert original["at"] == _iso(2026, 5, 1)
+
+
+def test_voucher_history_immutable_after_change_and_revocation(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research", "review"])
+    at = _iso(2026, 5, 1)
+
+    first = _issue_voucher(client, "v1", "a", "review", at)
+    assert first.status_code == 201
+    frozen = first.json()["voucher"]
+    assert frozen["allowed"] is True
+    assert frozen["basis"][0]["change_id"] == "ca"
+
+    # Revoking the underlying change flips the live decision for every instant.
+    assert _revoke(client, "ca", "r1", "登记有误").status_code == 201
+    live = _check(client, "a", "review", at).json()
+    assert live["allowed"] is False
+    assert live["blockers"][0]["reason"] == "no_valid_license"
+
+    # The voucher still reports the first-saved result verbatim.
+    fetched = _get_voucher(client, "v1").json()
+    assert fetched == frozen
+    assert fetched["allowed"] is True
+    assert fetched["basis"][0]["change_id"] == "ca"
+    assert fetched["blockers"] == []
+
+    # Retrying the same request afterwards replays the original as well.
+    retry = _issue_voucher(client, "v1", "a", "review", at)
+    assert retry.status_code == 200
+    assert retry.json()["voucher"] == frozen
+
+
+def test_voucher_history_immutable_after_later_change(client):
+    _register(client, "a")
+    _change(client, "ca1", "a", _iso(2026, 1, 1), ["research", "review"])
+    # Voucher for a July review request: currently allowed on ca1.
+    at = _iso(2026, 7, 1)
+    frozen = _issue_voucher(client, "v1", "a", "review", at).json()["voucher"]
+    assert frozen["allowed"] is True
+
+    # A narrowing change registered afterwards changes live July judgments...
+    assert _change(client, "ca2", "a", _iso(2026, 6, 1), ["research"]).status_code == 201
+    assert _check(client, "a", "review", at).json()["allowed"] is False
+    # ...but never rewrites the stored credential.
+    assert _get_voucher(client, "v1").json() == frozen
+
+
+def test_voucher_unknown_id_is_404(client):
+    resp = _get_voucher(client, "ghost")
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "not_found"
+
+
+def test_voucher_unknown_version_errors_without_leaving_row(client):
+    resp = _issue_voucher(client, "v1", "ghost", "research", _iso(2026, 5, 1))
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "not_found"
+
+    # No half-finished row: the same id can still be issued for a real version.
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    second = _issue_voucher(client, "v1", "a", "research", _iso(2026, 5, 1))
+    assert second.status_code == 201
+    assert second.json()["replayed"] is False
+
+
+def test_voucher_invalid_inputs_are_422_without_row(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+
+    blank_use = _issue_voucher(client, "v1", "a", "   ", _iso(2026, 5, 1))
+    assert blank_use.status_code == 422
+    naive_at = _issue_voucher(client, "v2", "a", "research", "2026-05-01T00:00:00")
+    assert naive_at.status_code == 422
+
+    # Nothing was persisted; both ids are still unknown.
+    assert _get_voucher(client, "v1").status_code == 404
+    assert _get_voucher(client, "v2").status_code == 404
+
+
+def test_voucher_without_id_is_generated(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    resp = client.post(
+        "/permissions/vouchers",
+        json={"version_id": "a", "use": "research", "at": _iso(2026, 5, 1)},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["voucher"]["voucher_id"].startswith("p-")
+
+
+def test_voucher_concurrent_same_id_issues_exactly_once(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    service = client.app.state.app_state.service  # type: ignore[attr-defined]
+    outcomes: list[tuple[str, int, bool]] = []
+    lock = __import__("threading").Lock()
+
+    def worker() -> None:
+        try:
+            _, replayed = service.issue_voucher(
+                voucher_id="v1",
+                version_id="a",
+                use="research",
+                at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+            )
+            with lock:
+                outcomes.append(("ok", 200 if replayed else 201, replayed))
+        except Exception as exc:  # noqa: BLE001
+            with lock:
+                outcomes.append((type(exc).__name__, getattr(exc, "status_code", 0), False))
+
+    import threading
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(name == "ok" for name, _, _ in outcomes), outcomes
+    assert sorted(code for _, code, _ in outcomes).count(201) == 1
+    assert all(replayed == (code == 200) for _, code, replayed in outcomes)
+    assert _get_voucher(client, "v1").status_code == 200
+
+
+def test_voucher_on_demo_seed(tmp_path):
+    db_path = str(tmp_path / "seed-voucher.db")
+    settings = Settings(db_path=db_path, init_db=True, seed_demo=True, echo=False)
+    with TestClient(create_app(settings)) as test_client:
+        # review on demo-derived-1 is blocked by demo-root-b in March.
+        resp = test_client.post(
+            "/permissions/vouchers",
+            json={
+                "voucher_id": "demo-voucher-1",
+                "version_id": "demo-derived-1",
+                "use": "review",
+                "at": "2026-03-01T00:00:00Z",
+            },
+        )
+        assert resp.status_code == 201
+        voucher = resp.json()["voucher"]
+        assert voucher["allowed"] is False
+        assert voucher["closure"] == ["demo-derived-1", "demo-root-a", "demo-root-b"]
+        assert any(
+            bl["version_id"] == "demo-root-b" and bl["reason"] == "use_not_allowed"
+            for bl in voucher["blockers"]
+        )
+
+        retry = test_client.post(
+            "/permissions/vouchers",
+            json={
+                "voucher_id": "demo-voucher-1",
+                "version_id": "demo-derived-1",
+                "use": " review ",
+                "at": "2026-03-01T08:00:00+08:00",
+            },
+        )
+        assert retry.status_code == 200
+        assert retry.json()["replayed"] is True
+        assert retry.json()["voucher"] == voucher
+
+
+
 def test_revoke_returns_receipt_and_is_traceable(client):
     _register(client, "v1")
     first = _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])

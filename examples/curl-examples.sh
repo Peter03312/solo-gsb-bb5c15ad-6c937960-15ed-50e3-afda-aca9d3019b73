@@ -90,3 +90,43 @@ curl -s "$BASE/permissions/check?version_id=example-v1&use=research&at=2026-05-0
 say "重放已作废变更不能恢复：仍 replayed=true 且带 revocation"
 curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
   -d '{"change_id":"example-c1","version_id":"example-v1","effective_at":"2026-03-01T00:00:00Z","allowed_uses":["research"]}'; echo
+
+say "判定凭证：首次签发 demo-derived-1 的 review @ 2026-03-01（被 root-b 拒绝，拒绝也留痕），201"
+curl -s -X POST "$BASE/permissions/vouchers" -H 'Content-Type: application/json' \
+  -d '{"voucher_id":"example-voucher-1","version_id":"demo-derived-1","use":" review ","at":"2026-03-01T08:00:00+08:00"}'; echo
+
+say "凭证重试：去空格用途 + 同一 UTC 瞬间（+08:00 与 Z 等价）-> 200 replayed=true，原凭证逐字段一致"
+curl -s -X POST "$BASE/permissions/vouchers" -H 'Content-Type: application/json' \
+  -d '{"voucher_id":"example-voucher-1","version_id":"demo-derived-1","use":"review","at":"2026-03-01T00:00:00Z"}'; echo
+
+say "凭证追溯：按标识取回首次保存的判定"
+curl -s "$BASE/permissions/vouchers/example-voucher-1"; echo
+
+say "凭证冲突：同一标识换用途 -> 409（原凭证不变）"
+curl -s -X POST "$BASE/permissions/vouchers" -H 'Content-Type: application/json' \
+  -d '{"voucher_id":"example-voucher-1","version_id":"demo-derived-1","use":"research","at":"2026-03-01T00:00:00Z"}'; echo
+
+say "凭证错误 1：未知版本 -> 404，不留凭证"
+curl -s -X POST "$BASE/permissions/vouchers" -H 'Content-Type: application/json' \
+  -d '{"voucher_id":"example-voucher-x","version_id":"no-such-version","use":"research","at":"2026-03-01T00:00:00Z"}'; echo
+
+say "凭证错误 2：无时区时刻 -> 422，不留凭证"
+curl -s -X POST "$BASE/permissions/vouchers" -H 'Content-Type: application/json' \
+  -d '{"voucher_id":"example-voucher-x","version_id":"demo-derived-1","use":"research","at":"2026-03-01T00:00:00"}'; echo
+
+say "凭证错误 3：空用途 -> 422，不留凭证"
+curl -s -X POST "$BASE/permissions/vouchers" -H 'Content-Type: application/json' \
+  -d '{"voucher_id":"example-voucher-x","version_id":"demo-derived-1","use":"   ","at":"2026-03-01T00:00:00Z"}'; echo
+
+say "凭证错误 4：未知凭证标识 -> 404"
+curl -s "$BASE/permissions/vouchers/no-such-voucher"; echo
+
+say "凭证不可变：允许的凭证签发后再收紧/作废，GET 仍返回首次结果"
+curl -s -X POST "$BASE/permissions/vouchers" -H 'Content-Type: application/json' \
+  -d '{"voucher_id":"example-voucher-2","version_id":"demo-derived-1","use":"research","at":"2026-05-01T00:00:00Z"}'; echo
+curl -s -X POST "$BASE/license-changes/revocations" -H 'Content-Type: application/json' \
+  -d '{"change_id":"demo-chg-d1-1","revocation_id":"rev-demo-d1-1","reason":"示例：收紧后凭证仍应保留首次结果"}' >/dev/null || true
+echo "# 实时判定此刻可能已变化："
+curl -s "$BASE/permissions/check?version_id=demo-derived-1&use=research&at=2026-05-01T00:00:00Z"; echo
+echo "# 而凭证恒为首次保存的 allowed=true："
+curl -s "$BASE/permissions/vouchers/example-voucher-2"; echo

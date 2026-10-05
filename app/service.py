@@ -106,6 +106,68 @@ def _revocation_out(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _freeze_decision(state: dict[str, Any]) -> str:
+    """Serialise an evaluated decision (datetimes -> canonical UTC) to JSON."""
+    payload = {
+        "allowed": state["allowed"],
+        "closure": list(state["closure"]),
+        "basis": [
+            {
+                "version_id": entry["version_id"],
+                "change_id": entry["change_id"],
+                "effective_at": to_canonical(entry["effective_at"]),
+                "allowed_uses": list(entry["allowed_uses"]),
+            }
+            for entry in state["basis"]
+        ],
+        "blockers": [
+            {
+                "version_id": entry["version_id"],
+                "reason": entry["reason"],
+                "change_id": entry.get("change_id"),
+                "effective_at": to_canonical(entry["effective_at"])
+                if entry.get("effective_at") is not None
+                else None,
+                "allowed_uses": list(entry.get("allowed_uses", ())),
+            }
+            for entry in state["blockers"]
+        ],
+        "allowed_uses_intersection": list(state["allowed_uses_intersection"]),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _thaw_decision(blob: str) -> dict[str, Any]:
+    """Inverse of :func:`_freeze_decision` for stored voucher history."""
+    data = json.loads(blob)
+    return {
+        "allowed": data["allowed"],
+        "closure": list(data["closure"]),
+        "basis": [
+            {
+                "version_id": entry["version_id"],
+                "change_id": entry["change_id"],
+                "effective_at": parse_canonical(entry["effective_at"]),
+                "allowed_uses": list(entry["allowed_uses"]),
+            }
+            for entry in data["basis"]
+        ],
+        "blockers": [
+            {
+                "version_id": entry["version_id"],
+                "reason": entry["reason"],
+                "change_id": entry.get("change_id"),
+                "effective_at": parse_canonical(entry["effective_at"])
+                if entry.get("effective_at") is not None
+                else None,
+                "allowed_uses": list(entry.get("allowed_uses", ())),
+            }
+            for entry in data["blockers"]
+        ],
+        "allowed_uses_intersection": list(data["allowed_uses_intersection"]),
+    }
+
+
 def _version_out(db: Database, row: dict[str, Any]) -> dict[str, Any]:
     changes = []
     for change in db.list_changes(row["version_id"]):
@@ -556,6 +618,130 @@ class LicenseService:
             "segments": segments,
         }
 
+    # -- permission vouchers (traceable frozen decisions) -----------------
+
+    def issue_voucher(
+        self,
+        voucher_id: str | None,
+        version_id: str,
+        use: str,
+        at: datetime,
+    ) -> tuple[dict[str, Any], bool]:
+        """Evaluate a permission decision and persist it as a frozen voucher.
+
+        The first request for ``voucher_id`` applies the *existing* decision
+        rules inside one write transaction against a single consistent
+        snapshot, and stores the server-generated registration time together
+        with the complete ancestor closure, basis, blockers and allowed-use
+        intersection — allow and deny alike are recorded. Evaluation and
+        storage are atomic: any failure rolls back and leaves no partial row.
+
+        Stored vouchers are immutable history. A retry with the same voucher
+        id, version, trimmed use and UTC-normalised instant returns the
+        original voucher untouched; later license changes or revocations
+        cannot rewrite it. Reusing the id against different inputs is a
+        conflict. Unknown version, empty use or naive time error out before
+        any row is written.
+        """
+        if at.tzinfo is None:
+            raise InvalidTimeError("判定时刻必须带时区信息")
+        use = use.strip()
+        if not use:
+            raise ServiceError("用途不能为空")
+        voucher_id = voucher_id or f"p-{uuid.uuid4().hex}"
+        at_canonical = to_canonical(at)
+
+        with self.db.lock:
+            existing = self.db.get_voucher(voucher_id)
+            if existing is not None:
+                same = (
+                    existing["version_id"] == version_id
+                    and existing["use_name"] == use
+                    and existing["at_value"] == at_canonical
+                )
+                if not same:
+                    raise ConflictError(
+                        "同一凭证标识已存在但输入不同（凭证标识不可复用指向不同判定）",
+                        {
+                            "voucher_id": voucher_id,
+                            "submitted_version_id": version_id,
+                            "existing_version_id": existing["version_id"],
+                            "submitted_use": use,
+                            "existing_use": existing["use_name"],
+                            "submitted_at": at_canonical,
+                            "existing_at": existing["at_value"],
+                        },
+                    )
+                return self._voucher_out(existing), True
+
+            try:
+                # BEGIN IMMEDIATE pins both a write lock and one snapshot: the
+                # version lookup, closure evaluation and insert commit as one
+                # atomic unit, so concurrent issuers cannot interleave.
+                self.db.begin()
+                if self.db.get_version(version_id) is None:
+                    raise NotFoundError(
+                        "版本不存在，无法签发判定凭证", {"version_id": version_id}
+                    )
+                snapshot = self._capture_snapshot(manage_transaction=False)
+                state = _evaluate(snapshot, version_id, use, at_canonical, None)
+                registered = to_canonical(now_utc())
+                self.db.insert_voucher(
+                    voucher_id=voucher_id,
+                    version_id=version_id,
+                    use_name=use,
+                    at_value=at_canonical,
+                    registered_at=registered,
+                    allowed=state["allowed"],
+                    decision_json=_freeze_decision(state),
+                )
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                # A concurrent writer may have won the same primary key: map
+                # the race onto replay/conflict exactly like a sequential call.
+                raced = self.db.get_voucher(voucher_id)
+                if raced is not None:
+                    same = (
+                        raced["version_id"] == version_id
+                        and raced["use_name"] == use
+                        and raced["at_value"] == at_canonical
+                    )
+                    if same:
+                        return self._voucher_out(raced), True
+                    raise ConflictError(
+                        "同一凭证标识已存在但输入不同（凭证标识不可复用指向不同判定）",
+                        {
+                            "voucher_id": voucher_id,
+                            "submitted_version_id": version_id,
+                            "existing_version_id": raced["version_id"],
+                        },
+                    ) from None
+                raise
+
+            stored = self.db.get_voucher(voucher_id)
+            assert stored is not None
+            return self._voucher_out(stored), False
+
+    def get_voucher(self, voucher_id: str) -> dict[str, Any]:
+        """Return the frozen first-saved decision for a voucher id."""
+        row = self.db.get_voucher(voucher_id)
+        if row is None:
+            raise NotFoundError("判定凭证不存在", {"voucher_id": voucher_id})
+        return self._voucher_out(row)
+
+    @staticmethod
+    def _voucher_out(row: dict[str, Any]) -> dict[str, Any]:
+        decision = _thaw_decision(row["decision_json"])
+        return {
+            "voucher_id": row["voucher_id"],
+            "version_id": row["version_id"],
+            "use": row["use_name"],
+            "at": parse_canonical(row["at_value"]),
+            "registered_at": parse_canonical(row["registered_at"]),
+            **decision,
+        }
+
     # -- change preview (no writes) ---------------------------------------
 
     def preview_change(
@@ -681,14 +867,20 @@ class LicenseService:
             "impacted_versions": impacted,
         }
 
-    def _capture_snapshot(self) -> Snapshot:
+    def _capture_snapshot(self, *, manage_transaction: bool = True) -> Snapshot:
         """Pin one consistent read snapshot of versions, edges and changes.
 
-        Runs inside the caller's db lock and inside a deferred read
-        transaction (WAL): all SELECTs see the same database state. The
-        transaction is rolled back afterwards — previews never write.
+        Runs inside the caller's db lock. With ``manage_transaction`` it opens
+        a deferred read transaction (WAL): the first SELECT pins a consistent
+        snapshot that stays stable until the rollback, and taking no write lock
+        keeps previews read-only. When ``manage_transaction`` is false the
+        caller already owns an open write transaction (voucher issuing): all
+        SELECTs then share that transaction's snapshot and its write lock, so
+        the evaluation and the subsequent insert are atomic against every
+        other writer.
         """
-        self.db.begin_read()
+        if manage_transaction:
+            self.db.begin_read()
         try:
             versions = {row["version_id"] for row in self.db.list_versions()}
             edges = self.db.all_parent_edges()
@@ -713,7 +905,8 @@ class LicenseService:
                 revoked_change_ids=revoked,
             )
         finally:
-            self.db.rollback()
+            if manage_transaction:
+                self.db.rollback()
 
 
 # -- immutable in-memory snapshot ------------------------------------------
