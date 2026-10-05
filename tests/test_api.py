@@ -318,6 +318,293 @@ def test_demo_fixture_permissions(tmp_path):
         assert later["allowed"] is True
 
 
+# -- permission decision credentials ---------------------------------------
+
+
+def _issue_credential(client, credential_id, version_id, use, at):
+    return client.post(
+        "/permissions/credentials",
+        json={
+            "credential_id": credential_id,
+            "version_id": version_id,
+            "use": use,
+            "at": at,
+        },
+    )
+
+
+def _get_credential(client, credential_id):
+    return client.get(f"/permissions/credentials/{credential_id}")
+
+
+def _credential_graph(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research", "review"])
+    _register(client, "b")
+    _change(client, "cb", "b", _iso(2026, 1, 1), ["research", "commercial"])
+    _register(client, "d1", ["a", "b"])
+    _change(client, "cd1", "d1", _iso(2026, 2, 1), ["research", "review", "commercial"])
+
+
+def test_credential_issue_allowed_freezes_full_decision(client):
+    _credential_graph(client)
+    at = _iso(2026, 3, 1)
+
+    resp = _issue_credential(client, "k1", "d1", "research", at)
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["replayed"] is False
+    cred = body["credential"]
+    assert cred["credential_id"] == "k1"
+    assert cred["version_id"] == "d1"
+    assert cred["use"] == "research"
+    assert cred["at"].startswith("2026-03-01T00:00:00")
+    assert cred["registered_at"].startswith("20")
+    assert cred["allowed"] is True
+    assert cred["closure"] == ["d1", "a", "b"]
+    assert {entry["version_id"] for entry in cred["basis"]} == {"d1", "a", "b"}
+    assert cred["blockers"] == []
+    assert cred["allowed_uses_intersection"] == ["research"]
+
+    # The live check and the credential share the exact decision shape.
+    live = _check(client, "d1", "research", at).json()
+    assert cred["closure"] == live["closure"]
+    assert cred["basis"] == live["basis"]
+    assert cred["blockers"] == live["blockers"]
+    assert cred["allowed_uses_intersection"] == live["allowed_uses_intersection"]
+
+    # GET returns the first saved result.
+    fetched = _get_credential(client, "k1")
+    assert fetched.status_code == 200
+    assert fetched.json() == cred
+
+
+def test_credential_issue_denied_is_persisted_too(client):
+    _credential_graph(client)
+    at = _iso(2026, 3, 1)
+
+    resp = _issue_credential(client, "k1", "d1", "review", at)
+    assert resp.status_code == 201
+    cred = resp.json()["credential"]
+    assert cred["allowed"] is False
+    assert [(bl["version_id"], bl["reason"]) for bl in cred["blockers"]] == [
+        ("b", "use_not_allowed")
+    ]
+    assert cred["blockers"][0]["change_id"] == "cb"
+    assert cred["allowed_uses_intersection"] == ["research"]
+    # A denied credential is traceable just like an allowed one.
+    assert _get_credential(client, "k1").json()["allowed"] is False
+
+
+def test_credential_issue_with_no_valid_license(client):
+    _register(client, "a")
+    resp = _issue_credential(client, "k1", "a", "research", _iso(2026, 3, 1))
+    assert resp.status_code == 201
+    cred = resp.json()["credential"]
+    assert cred["allowed"] is False
+    assert cred["basis"] == []
+    assert cred["blockers"] == [
+        {"version_id": "a", "reason": "no_valid_license", "change_id": None,
+         "effective_at": None, "allowed_uses": []}
+    ]
+    assert cred["allowed_uses_intersection"] == []
+    assert cred["closure"] == ["a"]
+
+
+def test_credential_retry_same_inputs_returns_original(client):
+    _credential_graph(client)
+    at = _iso(2026, 3, 1)
+    first = _issue_credential(client, "k1", "d1", " research ", at)
+    assert first.status_code == 201
+    first_cred = first.json()["credential"]
+
+    # Whitespace around the use and a different timezone spelling of the same
+    # instant are the same retry: 200 + replayed, identical stored credential.
+    retry = _issue_credential(
+        client, "k1", "d1", "research", "2026-03-01T08:00:00+08:00"
+    )
+    assert retry.status_code == 200
+    assert retry.json()["replayed"] is True
+    assert retry.json()["credential"] == first_cred
+    assert _get_credential(client, "k1").json() == first_cred
+
+
+def test_credential_same_id_different_inputs_conflicts(client):
+    _credential_graph(client)
+    assert _issue_credential(client, "k1", "d1", "research", _iso(2026, 3, 1)).status_code == 201
+
+    different_use = _issue_credential(client, "k1", "d1", "review", _iso(2026, 3, 1))
+    assert different_use.status_code == 409
+    assert different_use.json()["error"] == "conflict"
+
+    different_at = _issue_credential(client, "k1", "d1", "research", _iso(2026, 4, 1))
+    assert different_at.status_code == 409
+
+    different_version = _issue_credential(client, "k1", "a", "research", _iso(2026, 3, 1))
+    assert different_version.status_code == 409
+
+    # The original credential is untouched by the failed retries.
+    original = _get_credential(client, "k1").json()
+    assert original["version_id"] == "d1"
+    assert original["use"] == "research"
+    assert original["at"].startswith("2026-03-01T00:00:00")
+
+
+def test_credential_distinct_ids_are_independent(client):
+    _credential_graph(client)
+    at = _iso(2026, 3, 1)
+    allowed = _issue_credential(client, "k-ok", "d1", "research", at)
+    denied = _issue_credential(client, "k-no", "d1", "review", at)
+    assert allowed.status_code == 201
+    assert denied.status_code == 201
+    assert allowed.json()["credential"]["allowed"] is True
+    assert denied.json()["credential"]["allowed"] is False
+
+
+def test_credential_unknown_version_is_404_and_persists_nothing(client):
+    resp = _issue_credential(client, "k1", "ghost", "research", _iso(2026, 3, 1))
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "not_found"
+    assert _get_credential(client, "k1").status_code == 404
+
+
+def test_credential_unknown_id_get_is_404(client):
+    resp = _get_credential(client, "ghost-credential")
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "not_found"
+
+
+def test_credential_naive_at_is_422(client):
+    _register(client, "a")
+    resp = _issue_credential(client, "k1", "a", "research", "2026-03-01T00:00:00")
+    assert resp.status_code == 422
+    assert _get_credential(client, "k1").status_code == 404
+
+
+def test_credential_blank_use_is_422(client):
+    _register(client, "a")
+    resp = _issue_credential(client, "k1", "a", "   ", _iso(2026, 3, 1))
+    assert resp.status_code == 422
+    assert _get_credential(client, "k1").status_code == 404
+
+
+def test_credential_blank_id_is_422(client):
+    _register(client, "a")
+    resp = _issue_credential(client, "   ", "a", "research", _iso(2026, 3, 1))
+    assert resp.status_code == 422
+
+
+def test_credential_is_immutable_after_license_change(client):
+    _register(client, "a")
+    _change(client, "c1", "a", _iso(2026, 1, 1), ["research"])
+    at = _iso(2026, 5, 1)
+
+    first = _issue_credential(client, "k1", "a", "research", at)
+    assert first.status_code == 201
+    assert first.json()["credential"]["allowed"] is True
+    assert first.json()["credential"]["basis"][0]["change_id"] == "c1"
+
+    # A later change narrows the license: live decisions flip, but the frozen
+    # credential still reports the first decision.
+    _change(client, "c2", "a", _iso(2026, 4, 1), ["commercial"])
+    live = _check(client, "a", "research", at).json()
+    assert live["allowed"] is False
+    assert live["basis"][0]["change_id"] == "c2"
+
+    frozen = _get_credential(client, "k1").json()
+    assert frozen["allowed"] is True
+    assert frozen["basis"][0]["change_id"] == "c1"
+    assert frozen["blockers"] == []
+    assert frozen["allowed_uses_intersection"] == ["research"]
+
+
+def test_credential_is_immutable_after_revocation(client):
+    _register(client, "a")
+    _change(client, "c1", "a", _iso(2026, 1, 1), ["research", "review"])
+    at = _iso(2026, 5, 1)
+    assert _issue_credential(client, "k1", "a", "review", at).status_code == 201
+
+    _revoke(client, "c1", "r1", "登记有误")
+    # The live check now reports no_valid_license ...
+    live = _check(client, "a", "review", at).json()
+    assert live["allowed"] is False
+    assert live["blockers"][0]["reason"] == "no_valid_license"
+    # ... while the credential keeps the original, traceable decision.
+    frozen = _get_credential(client, "k1").json()
+    assert frozen["allowed"] is True
+    assert frozen["basis"] == [
+        {"version_id": "a", "change_id": "c1",
+         "effective_at": frozen["basis"][0]["effective_at"],
+         "allowed_uses": ["research", "review"]}
+    ]
+    assert frozen["basis"][0]["change_id"] == "c1"
+
+
+def test_credential_preserves_ancestor_closure_including_diamond(client):
+    # a <- b <- d1, a <- d1 (diamond): the frozen closure deduplicates a.
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    _register(client, "b", ["a"])
+    _change(client, "cb", "b", _iso(2026, 1, 1), ["research"])
+    _register(client, "d1", ["b", "a"])
+    _change(client, "cd1", "d1", _iso(2026, 1, 1), ["research"])
+
+    cred = _issue_credential(client, "k1", "d1", "research", _iso(2026, 2, 1)).json()[
+        "credential"
+    ]
+    assert cred["closure"] == ["d1", "b", "a"]
+    assert {entry["version_id"] for entry in cred["basis"]} == {"d1", "b", "a"}
+    assert _get_credential(client, "k1").json()["closure"] == ["d1", "b", "a"]
+
+
+def test_credential_issue_is_atomic_under_concurrent_retries(client):
+    _register(client, "a")
+    _change(client, "c1", "a", _iso(2026, 1, 1), ["research"])
+    service = client.app.state.app_state.service  # type: ignore[attr-defined]
+    at = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    statuses: list[tuple[str, int, bool]] = []
+    lock = __import__("threading").Lock()
+
+    def worker() -> None:
+        try:
+            _, replayed = service.issue_permission_credential("k1", "a", "research", at)
+            with lock:
+                statuses.append(("ok", 200 if replayed else 201, replayed))
+        except Exception as exc:  # noqa: BLE001
+            with lock:
+                statuses.append((type(exc).__name__, getattr(exc, "status_code", 0), False))
+
+    import threading
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(name == "ok" for name, _, _ in statuses), statuses
+    # Exactly one first-time registration; every other identical retry replays.
+    assert sorted(code for _, code, _ in statuses).count(201) == 1
+    assert all(replayed == (code == 200) for _, code, replayed in statuses)
+    fetched = _get_credential(client, "k1")
+    assert fetched.status_code == 200
+    assert fetched.json()["allowed"] is True
+
+
+def test_credential_endpoint_leaves_live_check_contract_untouched(client):
+    _credential_graph(client)
+    at = _iso(2026, 3, 1)
+    _issue_credential(client, "k1", "d1", "research", at)
+    # The real-time check keeps its original request/response contract:
+    # query params in, full PermissionResponse out, no credential fields.
+    resp = _check(client, "d1", "research", at)
+    assert resp.status_code == 200
+    assert set(resp.json()) == {
+        "version_id", "use", "at", "allowed", "closure",
+        "basis", "blockers", "allowed_uses_intersection",
+    }
+
+
 # -- change preview --------------------------------------------------------
 
 
@@ -1116,6 +1403,63 @@ def test_demo_seed_revocation_round_trip(tmp_path):
         original = test_client.get("/license-changes/demo-chg-a-2")
         assert original.status_code == 200
         assert original.json()["revocation"]["revocation_id"] == "rev-demo-a-2"
+
+
+def test_credential_on_demo_seed_end_to_end(tmp_path):
+    db_path = str(tmp_path / "seed-cred.db")
+    settings = Settings(db_path=db_path, init_db=True, seed_demo=True, echo=False)
+    with TestClient(create_app(settings)) as test_client:
+        at = "2026-03-01T08:00:00+08:00"  # == 2026-03-01T00:00:00Z
+        first = test_client.post(
+            "/permissions/credentials",
+            json={
+                "credential_id": "demo-cred-research",
+                "version_id": "demo-derived-1",
+                "use": "  research  ",
+                "at": at,
+            },
+        )
+        assert first.status_code == 201
+        cred = first.json()["credential"]
+        assert cred["allowed"] is True
+        assert cred["use"] == "research"
+        assert cred["at"].startswith("2026-03-01T00:00:00")
+        assert cred["closure"] == ["demo-derived-1", "demo-root-a", "demo-root-b"]
+        assert cred["allowed_uses_intersection"] == ["research"]
+
+        # Replay with the UTC spelling returns the original registered_at.
+        retry = test_client.post(
+            "/permissions/credentials",
+            json={
+                "credential_id": "demo-cred-research",
+                "version_id": "demo-derived-1",
+                "use": "research",
+                "at": "2026-03-01T00:00:00Z",
+            },
+        )
+        assert retry.status_code == 200
+        assert retry.json()["credential"] == cred
+
+        # Denied requests leave a credential too.
+        denied = test_client.post(
+            "/permissions/credentials",
+            json={
+                "credential_id": "demo-cred-review",
+                "version_id": "demo-derived-1",
+                "use": "review",
+                "at": "2026-07-01T00:00:00Z",
+            },
+        )
+        assert denied.status_code == 201
+        assert denied.json()["credential"]["allowed"] is False
+        blockers = {
+            (bl["version_id"], bl["reason"])
+            for bl in denied.json()["credential"]["blockers"]
+        }
+        assert blockers == {
+            ("demo-root-a", "use_not_allowed"),
+            ("demo-root-b", "use_not_allowed"),
+        }
 
 
 def test_timeline_on_demo_seed(tmp_path):

@@ -21,6 +21,8 @@ from .schemas import (
     ImpactedVersion,
     LicenseChangeRequest,
     LicenseChangeResponse,
+    PermissionCredentialRequest,
+    PermissionCredentialResponse,
     PermissionResponse,
     PermissionSegment,
     PermissionTimelineResponse,
@@ -325,6 +327,54 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             end=result["end"],
             closure=result["closure"],
             segments=[PermissionSegment(**segment) for segment in result["segments"]],
+        )
+
+    # -- permission decision credentials ----------------------------------
+
+    @app.post(
+        "/permissions/credentials",
+        response_model=CreateResponse,
+        status_code=201,
+        tags=["permissions"],
+        summary="把一次用途判定作为可追溯凭证原子登记（允许与拒绝都留痕，幂等）",
+        responses={
+            200: {"description": "相同凭证标识与输入重试，返回首次保存的原凭证"},
+            201: {"description": "凭证首次创建并持久化（允许或拒绝均留痕）"},
+            404: {"description": "版本不存在"},
+            409: {"description": "凭证标识复用指向不同输入（版本/用途/时刻不同）"},
+            422: {"description": "判定时刻无时区、用途为空或参数非法"},
+        },
+    )
+    def issue_permission_credential(
+        payload: PermissionCredentialRequest, request: Request
+    ) -> JSONResponse | CreateResponse:
+        credential, replayed = service_from(request).issue_permission_credential(
+            credential_id=payload.credential_id,
+            version_id=payload.version_id,
+            use=payload.use,
+            at=payload.at,
+        )
+        body = CreateResponse(
+            replayed=replayed,
+            credential=PermissionCredentialResponse(**credential),
+        )
+        if replayed:
+            # 200 OK makes an idempotent retry distinguishable from creation.
+            return JSONResponse(status_code=200, content=body.model_dump(mode="json"))
+        return body
+
+    @app.get(
+        "/permissions/credentials/{credential_id}",
+        response_model=PermissionCredentialResponse,
+        tags=["permissions"],
+        summary="按凭证标识追溯首次保存的判定凭证（历史不随后续变更/作废改写）",
+        responses={404: {"description": "凭证不存在"}},
+    )
+    def get_permission_credential(
+        credential_id: str, request: Request
+    ) -> PermissionCredentialResponse:
+        return PermissionCredentialResponse(
+            **service_from(request).get_permission_credential(credential_id)
         )
 
     return app

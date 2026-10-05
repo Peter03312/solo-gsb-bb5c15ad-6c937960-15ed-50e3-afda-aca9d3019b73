@@ -58,11 +58,32 @@ SCHEMA_STATEMENTS = [
         created_at    TEXT NOT NULL
     )
     """,
+    # A decision credential freezes one use decision at the instant it was
+    # first issued. Every evaluation input and result (closure, basis,
+    # blockers, intersection, server-registered time) is stored on the row, so
+    # later license changes or revocations can never rewrite history: reads
+    # only touch this table.
+    """
+    CREATE TABLE IF NOT EXISTS permission_credentials (
+        credential_id TEXT PRIMARY KEY,
+        version_id    TEXT NOT NULL,
+        use_value     TEXT NOT NULL,
+        at_value      TEXT NOT NULL,
+        registered_at TEXT NOT NULL,
+        allowed       INTEGER NOT NULL,
+        closure       TEXT NOT NULL,
+        basis         TEXT NOT NULL,
+        blockers      TEXT NOT NULL,
+        intersection  TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_changes_version_time "
     "ON license_changes(version_id, effective_at)",
     "CREATE INDEX IF NOT EXISTS idx_parents_version ON version_parents(version_id)",
     "CREATE INDEX IF NOT EXISTS idx_parents_parent ON version_parents(parent_id)",
     "CREATE INDEX IF NOT EXISTS idx_revocations_change ON change_revocations(change_id)",
+    "CREATE INDEX IF NOT EXISTS idx_credentials_version "
+    "ON permission_credentials(version_id)",
 ]
 
 
@@ -143,7 +164,11 @@ class Database:
             raise
 
     def rollback(self) -> None:
-        self._conn.execute("ROLLBACK")
+        # ROLLBACK outside a transaction raises OperationalError; this may
+        # legitimately happen on an error path where the transaction was
+        # already closed (e.g. COMMIT itself rolled back on a constraint).
+        if self._conn.in_transaction:
+            self._conn.execute("ROLLBACK")
 
     # -- versions ---------------------------------------------------------
 
@@ -281,4 +306,44 @@ class Database:
             "(revocation_id, change_id, reason, created_at) "
             "VALUES (?, ?, ?, ?)",
             (revocation_id, change_id, reason, created_at),
+        )
+
+    # -- permission decision credentials ----------------------------------
+
+    def get_credential(self, credential_id: str) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM permission_credentials WHERE credential_id = ?",
+            (credential_id,),
+        )
+
+    def insert_credential(
+        self,
+        credential_id: str,
+        version_id: str,
+        use_value: str,
+        at_value: str,
+        registered_at: str,
+        allowed: bool,
+        closure: list[str],
+        basis: list[dict[str, Any]],
+        blockers: list[dict[str, Any]],
+        intersection: list[str],
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO permission_credentials "
+            "(credential_id, version_id, use_value, at_value, registered_at, "
+            "allowed, closure, basis, blockers, intersection) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                credential_id,
+                version_id,
+                use_value,
+                at_value,
+                registered_at,
+                1 if allowed else 0,
+                json.dumps(closure, ensure_ascii=False),
+                json.dumps(basis, ensure_ascii=False),
+                json.dumps(blockers, ensure_ascii=False),
+                json.dumps(intersection, ensure_ascii=False),
+            ),
         )

@@ -106,6 +106,84 @@ def _revocation_out(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _state_json(state: dict[str, Any]) -> dict[str, Any]:
+    """JSON-safe form of an evaluation result for credential persistence."""
+    return {
+        "allowed": state["allowed"],
+        "closure": list(state["closure"]),
+        "basis": [
+            {
+                "version_id": entry["version_id"],
+                "change_id": entry["change_id"],
+                "effective_at": to_canonical(entry["effective_at"]),
+                "allowed_uses": list(entry["allowed_uses"]),
+            }
+            for entry in state["basis"]
+        ],
+        "blockers": [
+            {
+                "version_id": entry["version_id"],
+                "reason": entry["reason"],
+                "change_id": entry.get("change_id"),
+                "effective_at": to_canonical(entry["effective_at"])
+                if entry.get("effective_at") is not None
+                else None,
+                "allowed_uses": list(entry.get("allowed_uses", [])),
+            }
+            for entry in state["blockers"]
+        ],
+        "allowed_uses_intersection": list(state["allowed_uses_intersection"]),
+    }
+
+
+def _credential_out(row: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild a stored credential row into the decision response shape."""
+    basis = json.loads(row["basis"])
+    blockers = json.loads(row["blockers"])
+    return {
+        "credential_id": row["credential_id"],
+        "version_id": row["version_id"],
+        "use": row["use_value"],
+        "at": parse_canonical(row["at_value"]),
+        "registered_at": parse_canonical(row["registered_at"]),
+        "allowed": bool(row["allowed"]),
+        "closure": json.loads(row["closure"]),
+        "basis": [
+            {
+                "version_id": entry["version_id"],
+                "change_id": entry["change_id"],
+                "effective_at": parse_canonical(entry["effective_at"]),
+                "allowed_uses": list(entry["allowed_uses"]),
+            }
+            for entry in basis
+        ],
+        "blockers": [
+            {
+                "version_id": entry["version_id"],
+                "reason": entry["reason"],
+                "change_id": entry.get("change_id"),
+                "effective_at": parse_canonical(entry["effective_at"])
+                if entry.get("effective_at")
+                else None,
+                "allowed_uses": list(entry.get("allowed_uses", [])),
+            }
+            for entry in blockers
+        ],
+        "allowed_uses_intersection": json.loads(row["intersection"]),
+    }
+
+
+def _same_credential_inputs(
+    row: dict[str, Any], version_id: str, use: str, at_canonical: str
+) -> bool:
+    """Whether a stored credential was issued for exactly these inputs."""
+    return (
+        row["version_id"] == version_id
+        and row["use_value"] == use
+        and row["at_value"] == at_canonical
+    )
+
+
 def _version_out(db: Database, row: dict[str, Any]) -> dict[str, Any]:
     changes = []
     for change in db.list_changes(row["version_id"]):
@@ -471,6 +549,127 @@ class LicenseService:
             "allowed_uses_intersection": result_intersection,
         }
 
+    # -- permission decision credentials (traceable receipts) -------------
+
+    def issue_permission_credential(
+        self,
+        credential_id: str,
+        version_id: str,
+        use: str,
+        at: datetime,
+    ) -> tuple[dict[str, Any], bool]:
+        """Evaluate a permission decision and persist it as an immutable credential.
+
+        The first request for a ``credential_id`` runs the existing decision
+        rules on one consistent snapshot and stores the decision together with
+        the server-generated registration time, the full ancestor closure, the
+        basis, every blocker and the allowed-use intersection — allowed and
+        denied decisions alike. Evaluation and persistence are a single atomic
+        write transaction: on failure nothing is left behind.
+
+        Retrying with the same id, version, use (compared after stripping
+        leading/trailing whitespace) and query instant (compared after
+        normalising to UTC) returns the original credential. Reusing the id
+        with different inputs is a conflict. Unknown versions, empty uses and
+        naive instants are rejected before any write.
+
+        Returns ``(credential, replayed)``.
+        """
+        if at.tzinfo is None:
+            raise InvalidTimeError("判定时刻必须带时区信息")
+        use = use.strip()
+        if not use:
+            raise ServiceError("用途不能为空")
+        credential_id = credential_id.strip()
+        if not credential_id:
+            raise ServiceError("凭证标识不能为空")
+
+        at_utc = at.astimezone(timezone.utc)
+        at_canonical = to_canonical(at_utc)
+
+        # Fast path: an existing id is either an identical retry (return the
+        # frozen result) or an id reuse with different inputs (conflict).
+        existing = self.db.get_credential(credential_id)
+        if existing is not None:
+            if not _same_credential_inputs(existing, version_id, use, at_canonical):
+                raise ConflictError(
+                    "凭证标识已存在但输入不同（凭证标识不可复用指向不同判定输入）",
+                    {
+                        "credential_id": credential_id,
+                        "submitted_version_id": version_id,
+                        "existing_version_id": existing["version_id"],
+                        "submitted_use": use,
+                        "existing_use": existing["use_value"],
+                        "submitted_at": at_canonical,
+                        "existing_at": existing["at_value"],
+                    },
+                )
+            return _credential_out(existing), True
+
+        with self.db.lock:
+            transaction_active = False
+            try:
+                # BEGIN IMMEDIATE takes the write lock up front; every read
+                # inside this transaction sees one consistent snapshot, and no
+                # concurrent writer can interleave between evaluation and the
+                # credential insert — so decision and storage are atomic.
+                self.db.begin()
+                transaction_active = True
+
+                snapshot = self._capture_snapshot()
+                if version_id not in snapshot.versions:
+                    raise NotFoundError("版本不存在", {"version_id": version_id})
+
+                state = _evaluate(snapshot, version_id, use, at_canonical, None)
+                frozen = _state_json(state)
+                registered = to_canonical(now_utc())
+
+                self.db.insert_credential(
+                    credential_id=credential_id,
+                    version_id=version_id,
+                    use_value=use,
+                    at_value=at_canonical,
+                    registered_at=registered,
+                    allowed=frozen["allowed"],
+                    closure=frozen["closure"],
+                    basis=frozen["basis"],
+                    blockers=frozen["blockers"],
+                    intersection=frozen["allowed_uses_intersection"],
+                )
+                self.db.commit()
+                transaction_active = False
+            except Exception:
+                # Roll the whole evaluate-and-persist unit back: validation
+                # errors and storage failures alike leave no half credential.
+                if transaction_active:
+                    self.db.rollback()
+                stored = self.db.get_credential(credential_id)
+                if stored is not None:
+                    # Lost a concurrent insert race: apply replay/conflict
+                    # semantics to the winner instead of failing opaquely.
+                    if _same_credential_inputs(stored, version_id, use, at_canonical):
+                        return _credential_out(stored), True
+                    raise ConflictError(
+                        "凭证标识已存在但输入不同（凭证标识不可复用指向不同判定输入）",
+                        {"credential_id": credential_id},
+                    ) from None
+                raise
+
+        stored = self.db.get_credential(credential_id)
+        assert stored is not None
+        return _credential_out(stored), False
+
+    def get_permission_credential(self, credential_id: str) -> dict[str, Any]:
+        """Return the credential exactly as it was first stored.
+
+        The row is a frozen snapshot of the original decision; later license
+        changes and revocations never alter it.
+        """
+        row = self.db.get_credential(credential_id)
+        if row is None:
+            raise NotFoundError("判定凭证不存在", {"credential_id": credential_id})
+        return _credential_out(row)
+
     # -- permission timeline (interval segmentation) ----------------------
 
     def check_permission_timeline(
@@ -510,7 +709,11 @@ class LicenseService:
             )
 
         with self.db.lock:
-            snapshot = self._capture_snapshot()
+            self.db.begin_read()
+            try:
+                snapshot = self._capture_snapshot()
+            finally:
+                self.db.rollback()
         if version_id not in snapshot.versions:
             raise NotFoundError("版本不存在", {"version_id": version_id})
 
@@ -595,42 +798,46 @@ class LicenseService:
         digest = content_hash(version_id, effective, uses)
 
         with self.db.lock:
-            if self.db.get_version(version_id) is None:
-                raise NotFoundError("版本不存在，无法为其预演许可变更", {"version_id": version_id})
+            self.db.begin_read()
+            try:
+                if self.db.get_version(version_id) is None:
+                    raise NotFoundError("版本不存在，无法为其预演许可变更", {"version_id": version_id})
 
-            existing = self.db.get_change(change_id)
-            replayed = False
-            if existing is not None:
-                same = (
-                    existing["version_id"] == version_id
-                    and existing["effective_at"] == effective
-                    and existing["content_hash"] == digest
-                )
-                if not same:
-                    raise ConflictError(
-                        "相同变更标识已存在但内容不同",
-                        {
-                            "change_id": change_id,
-                            "submitted_version_id": version_id,
-                            "existing_version_id": existing["version_id"],
-                            "submitted_effective_at": effective,
-                            "existing_effective_at": existing["effective_at"],
-                        },
+                existing = self.db.get_change(change_id)
+                replayed = False
+                if existing is not None:
+                    same = (
+                        existing["version_id"] == version_id
+                        and existing["effective_at"] == effective
+                        and existing["content_hash"] == digest
                     )
-                replayed = True
-            else:
-                twin = self.db.change_at_same_time(version_id, effective)
-                if twin is not None and twin["change_id"] != change_id:
-                    raise ConflictError(
-                        "该版本在同一生效时刻已存在不同变更",
-                        {
-                            "version_id": version_id,
-                            "effective_at": effective,
-                            "existing_change_id": twin["change_id"],
-                            "submitted_change_id": change_id,
-                        },
-                    )
-            snapshot = self._capture_snapshot()
+                    if not same:
+                        raise ConflictError(
+                            "相同变更标识已存在但内容不同",
+                            {
+                                "change_id": change_id,
+                                "submitted_version_id": version_id,
+                                "existing_version_id": existing["version_id"],
+                                "submitted_effective_at": effective,
+                                "existing_effective_at": existing["effective_at"],
+                            },
+                        )
+                    replayed = True
+                else:
+                    twin = self.db.change_at_same_time(version_id, effective)
+                    if twin is not None and twin["change_id"] != change_id:
+                        raise ConflictError(
+                            "该版本在同一生效时刻已存在不同变更",
+                            {
+                                "version_id": version_id,
+                                "effective_at": effective,
+                                "existing_change_id": twin["change_id"],
+                                "submitted_change_id": change_id,
+                            },
+                        )
+                snapshot = self._capture_snapshot()
+            finally:
+                self.db.rollback()
 
         at_canonical = to_canonical(at)
         scope = snapshot.descendants_of(version_id)
@@ -684,36 +891,35 @@ class LicenseService:
     def _capture_snapshot(self) -> Snapshot:
         """Pin one consistent read snapshot of versions, edges and changes.
 
-        Runs inside the caller's db lock and inside a deferred read
-        transaction (WAL): all SELECTs see the same database state. The
-        transaction is rolled back afterwards — previews never write.
+        Runs inside the caller's transaction: a deferred read (WAL) or a
+        ``BEGIN IMMEDIATE`` write transaction alike. The first SELECT pins a
+        consistent snapshot that stays stable until the transaction ends, so
+        all SELECTs see the same database state. Read-only callers roll back
+        afterwards; credential issuance reuses the same snapshot for its
+        atomic evaluate-then-persist transaction.
         """
-        self.db.begin_read()
-        try:
-            versions = {row["version_id"] for row in self.db.list_versions()}
-            edges = self.db.all_parent_edges()
-            revoked = set(self.db.list_revoked_change_ids())
-            changes: dict[str, list[EffectiveChange]] = {}
-            rows = self.db.query_all(
-                "SELECT * FROM license_changes ORDER BY version_id, effective_at, change_id"
-            )
-            for row in rows:
-                changes.setdefault(row["version_id"], []).append(
-                    EffectiveChange(
-                        change_id=row["change_id"],
-                        version_id=row["version_id"],
-                        effective_at=row["effective_at"],
-                        allowed_uses=list(row["allowed_uses"]),
-                    )
+        versions = {row["version_id"] for row in self.db.list_versions()}
+        edges = self.db.all_parent_edges()
+        revoked = set(self.db.list_revoked_change_ids())
+        changes: dict[str, list[EffectiveChange]] = {}
+        rows = self.db.query_all(
+            "SELECT * FROM license_changes ORDER BY version_id, effective_at, change_id"
+        )
+        for row in rows:
+            changes.setdefault(row["version_id"], []).append(
+                EffectiveChange(
+                    change_id=row["change_id"],
+                    version_id=row["version_id"],
+                    effective_at=row["effective_at"],
+                    allowed_uses=list(row["allowed_uses"]),
                 )
-            return Snapshot(
-                versions=versions,
-                edges=edges,
-                changes=changes,
-                revoked_change_ids=revoked,
             )
-        finally:
-            self.db.rollback()
+        return Snapshot(
+            versions=versions,
+            edges=edges,
+            changes=changes,
+            revoked_change_ids=revoked,
+        )
 
 
 # -- immutable in-memory snapshot ------------------------------------------

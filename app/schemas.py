@@ -182,12 +182,57 @@ class PermissionTimelineResponse(BaseModel):
     )
 
 
+class PermissionCredentialRequest(BaseModel):
+    """Inputs of a decision that must be frozen as a traceable credential."""
+
+    credential_id: str = Field(
+        min_length=1, max_length=128, description="唯一凭证标识；相同输入重试返回原凭证，复用指向不同输入报 409"
+    )
+    version_id: str = Field(min_length=1, description="已登记的数据集版本")
+    use: str = Field(min_length=1, description="拟使用的用途（去首尾空格后参与幂等判定，不能为空）")
+    at: datetime = Field(description="判定时刻（必须带时区；换算为 UTC 后参与幂等判定）")
+
+    _check_time = field_validator("at")(_ensure_aware)
+
+    @field_validator("credential_id")
+    @classmethod
+    def _credential_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("credential_id 不能为空白字符串")
+        return value
+
+    @field_validator("use")
+    @classmethod
+    def _use(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("use 不能为空字符串")
+        return value
+
+
+class PermissionCredentialResponse(BaseModel):
+    """首次判定冻结下来的凭证：之后许可变更或作废都不会改写它。"""
+
+    credential_id: str
+    version_id: str
+    use: str
+    at: datetime = Field(description="判定时刻（统一换算为 UTC）")
+    registered_at: datetime = Field(description="服务按 UTC 生成的凭证登记时间（仅首次写入，重试不变）")
+    allowed: bool
+    closure: list[str] = Field(description="首次判定时的自身及全部祖先闭包（去重、广度优先）")
+    basis: list[BasisEntry] = Field(default_factory=list, description="首次判定各版本所依据的最近变更")
+    blockers: list[BlockerEntry] = Field(default_factory=list, description="首次判定的全部阻断版本与原因（允许时为空）")
+    allowed_uses_intersection: list[str] = Field(default_factory=list)
+
+
 class CreateResponse(BaseModel):
     """Response wrapper that reports whether a submission was replayed."""
 
     replayed: bool
     change: LicenseChangeResponse | None = None
     version: VersionResponse | None = None
+    credential: PermissionCredentialResponse | None = None
 
 
 # -- change preview --------------------------------------------------------

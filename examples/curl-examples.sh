@@ -90,3 +90,31 @@ curl -s "$BASE/permissions/check?version_id=example-v1&use=research&at=2026-05-0
 say "重放已作废变更不能恢复：仍 replayed=true 且带 revocation"
 curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
   -d '{"change_id":"example-c1","version_id":"example-v1","effective_at":"2026-03-01T00:00:00Z","allowed_uses":["research"]}'; echo
+
+say "判定凭证：把 demo-derived-1 在 2026-03-01 的 research 判定登记为可追溯凭证（201）"
+curl -s -X POST "$BASE/permissions/credentials" -H 'Content-Type: application/json' \
+  -d '{"credential_id":"example-cred-1","version_id":"demo-derived-1","use":" research ","at":"2026-03-01T08:00:00+08:00"}'; echo
+
+say "凭证重试：用途去空格、时刻换算 UTC 后相同 -> 200 replayed=true，返回原凭证"
+curl -s -X POST "$BASE/permissions/credentials" -H 'Content-Type: application/json' \
+  -d '{"credential_id":"example-cred-1","version_id":"demo-derived-1","use":"research","at":"2026-03-01T00:00:00Z"}'; echo
+
+say "凭证冲突：同一凭证标识换用途 -> 409（原凭证不动）"
+curl -s -X POST "$BASE/permissions/credentials" -H 'Content-Type: application/json' \
+  -d '{"credential_id":"example-cred-1","version_id":"demo-derived-1","use":"review","at":"2026-03-01T00:00:00Z"}'; echo
+
+say "拒绝同样留痕：2026-07-01 对 demo-derived-1 申请 review 的凭证 allowed=false"
+curl -s -X POST "$BASE/permissions/credentials" -H 'Content-Type: application/json' \
+  -d '{"credential_id":"example-cred-2","version_id":"demo-derived-1","use":"review","at":"2026-07-01T00:00:00Z"}'; echo
+
+say "凭证追溯：按凭证标识取回首次保存的结果"
+curl -s "$BASE/permissions/credentials/example-cred-1"; echo
+
+say "凭证错误：未知凭证 -> 404；空用途 -> 422；无时区时刻 -> 422（均不留凭证）"
+curl -s "$BASE/permissions/credentials/no-such-credential"; echo
+curl -s -X POST "$BASE/permissions/credentials" -H 'Content-Type: application/json' \
+  -d '{"credential_id":"example-cred-bad","version_id":"demo-derived-1","use":"   ","at":"2026-03-01T00:00:00Z"}'; echo
+curl -s -X POST "$BASE/permissions/credentials" -H 'Content-Type: application/json' \
+  -d '{"credential_id":"example-cred-bad","version_id":"demo-derived-1","use":"research","at":"2026-03-01T00:00:00"}'; echo
+curl -s -o /dev/null -w "非法请求未留凭证，查询 example-cred-bad -> HTTP %{http_code}\n" \
+  "$BASE/permissions/credentials/example-cred-bad"
